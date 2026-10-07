@@ -326,6 +326,20 @@ def _compressed_tensors_quantization(quantization_config: dict) -> dict:
     )
 
 
+def _modelopt_quantization(quantization_config: dict) -> dict:
+    """Map a ModelOpt config to an MLX quantization dict.
+
+    ``config.json`` keeps the ModelOpt fields at the top level of
+    ``quantization_config``. ``hf_quant_config.json`` nests them under
+    ``quantization``. NVFP4 always uses groups of 16.
+    """
+    fields = quantization_config.get("quantization", quantization_config)
+    algo = fields.get("quant_algo")
+    if algo != "NVFP4":
+        raise ValueError(f"Unsupported modelopt quant_algo: {algo}")
+    return {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
 # transformers tags non-finite floats so config.json stays valid JSON, e.g.
 # {"__float__": "Infinity"}. Undo it or the value arrives as a dict.
 _FLOAT_TAG_KEY = "__float__"
@@ -477,6 +491,17 @@ def load_model(
         if "quantization_config" in text_config:
             config["quantization_config"] = text_config["quantization_config"]
 
+    if "quantization_config" not in config:
+        # NVIDIA ModelOpt exports keep their quantization metadata in a separate
+        # file rather than in config.json.
+        hf_quant_config = model_path / "hf_quant_config.json"
+        if hf_quant_config.exists():
+            with open(hf_quant_config, "r") as fid:
+                config["quantization_config"] = {
+                    "quant_method": "modelopt",
+                    **json.load(fid),
+                }
+
     model_args = model_args_class.from_dict(config)
 
     model = model_class(model_args)
@@ -493,7 +518,14 @@ def load_model(
                 return False
             if f"{p}.scales" not in weights:
                 return False
-            return infer_quant_config(p, m, weights)
+            params = infer_quant_config(p, m, weights)
+            # An nvfp4 tensor scale is a parameter of the layer, so the layer has
+            # to be built to hold one. Whether it needs one is a property of the
+            # checkpoint, so read it from the weights rather than the config:
+            # externally produced nvfp4 does not carry per-layer entries.
+            if f"{p}.global_scale" in weights and _takes_global_scale(m):
+                params["global_scale"] = True
+            return params
 
         nn.quantize(
             model,
@@ -536,6 +568,11 @@ def load_model(
             _quantize(quantization)
         elif quant_method == "compressed-tensors":
             quantization = _compressed_tensors_quantization(quantization_config)
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
+        elif quant_method == "modelopt":
+            quantization = _modelopt_quantization(quantization_config)
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
@@ -942,12 +979,19 @@ def save_model(
         )
 
 
+def _takes_global_scale(module: nn.Module) -> bool:
+    """Only some layers hold an nvfp4 tensor scale."""
+    params = inspect.signature(module.to_quantized).parameters
+    return "global_scale" in params
+
+
 def quantize_model(
     model: nn.Module,
     config: dict,
     group_size: Optional[int],
     bits: Optional[int],
     mode: str = "affine",
+    global_scale: bool = False,
     quant_predicate: Optional[Callable[[str, nn.Module], Union[bool, dict]]] = None,
 ) -> Tuple[nn.Module, dict]:
     """
@@ -959,6 +1003,8 @@ def quantize_model(
         group_size (Optional[int]): Group size for quantization.
         bits (Optional[int]): Bits per weight for quantization.
         mode (str): The quantization mode.
+        global_scale (bool): Use one ``nvfp4`` tensor scale per expert on the
+          switch layers. Only these layers support it for now.
         quant_predicate (Callable): A callable that decides how to quantize
           each layer based on the path. Accepts the layer `path` and the
           `module`. Returns either a bool to signify quantize/no quantize or
@@ -989,7 +1035,7 @@ def quantize_model(
         fine_grained_config = True
     else:
         fine_grained_config = False
-        quantized_config["quantization"] = quant_params
+        quantized_config["quantization"] = dict(quant_params)
 
     def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
@@ -999,6 +1045,12 @@ def quantize_model(
         bool_or_params = True
         if quant_predicate is not None:
             bool_or_params = quant_predicate(path, module)
+        # The scale is a parameter of the layer, so the config must record it
+        # for the loader to rebuild the same shapes.
+        if global_scale and bool_or_params and _takes_global_scale(module):
+            if not isinstance(bool_or_params, dict):
+                bool_or_params = dict(quant_params)
+            bool_or_params["global_scale"] = True
         if isinstance(bool_or_params, dict):
             quantized_config["quantization"][path] = bool_or_params
         elif fine_grained_config and bool_or_params:
@@ -1047,14 +1099,30 @@ def dequantize_model(model: nn.Module) -> nn.Module:
             cls = SwitchLinear
         else:
             continue
-        weight = mx.dequantize(
-            module.weight,
-            module.scales,
-            module.biases,
-            module.group_size,
-            module.bits,
-            module.mode,
-        )
+        if (global_scale := module.get("global_scale")) is not None:
+            # dequantize takes one scalar nvfp4 tensor scale, so go per expert.
+            weight = mx.stack(
+                [
+                    mx.dequantize(
+                        module.weight[e],
+                        module.scales[e],
+                        group_size=module.group_size,
+                        bits=module.bits,
+                        mode=module.mode,
+                        global_scale=global_scale[e],
+                    )
+                    for e in range(global_scale.shape[0])
+                ]
+            )
+        else:
+            weight = mx.dequantize(
+                module.weight,
+                module.scales,
+                module.biases,
+                module.group_size,
+                module.bits,
+                module.mode,
+            )
         args = weight.shape[::-1]
         m = cls(*args, **kwargs)
         if bias:
