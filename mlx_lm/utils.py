@@ -326,6 +326,20 @@ def _compressed_tensors_quantization(quantization_config: dict) -> dict:
     )
 
 
+def _modelopt_quantization(quantization_config: dict) -> dict:
+    """Map a ModelOpt config to an MLX quantization dict.
+
+    ``config.json`` keeps the ModelOpt fields at the top level of
+    ``quantization_config``. ``hf_quant_config.json`` nests them under
+    ``quantization``. NVFP4 always uses groups of 16.
+    """
+    fields = quantization_config.get("quantization", quantization_config)
+    algo = fields.get("quant_algo")
+    if algo != "NVFP4":
+        raise ValueError(f"Unsupported modelopt quant_algo: {algo}")
+    return {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
 # transformers tags non-finite floats so config.json stays valid JSON, e.g.
 # {"__float__": "Infinity"}. Undo it or the value arrives as a dict.
 _FLOAT_TAG_KEY = "__float__"
@@ -483,7 +497,10 @@ def load_model(
         hf_quant_config = model_path / "hf_quant_config.json"
         if hf_quant_config.exists():
             with open(hf_quant_config, "r") as fid:
-                config["quantization_config"] = json.load(fid)
+                config["quantization_config"] = {
+                    "quant_method": "modelopt",
+                    **json.load(fid),
+                }
 
     model_args = model_args_class.from_dict(config)
 
@@ -555,15 +572,7 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
         elif quant_method == "modelopt":
-            # NVIDIA ModelOpt.
-            algo = quantization_config["quantization"]["quant_algo"]
-            if algo != "NVFP4":
-                raise ValueError(f"Unsupported modelopt quant_algo: {algo}")
-            quantization = {
-                "group_size": quantization_config["quantization"].get("group_size", 16),
-                "bits": 4,
-                "mode": "nvfp4",
-            }
+            quantization = _modelopt_quantization(quantization_config)
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
