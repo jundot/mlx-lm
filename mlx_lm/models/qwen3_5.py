@@ -100,7 +100,7 @@ class VisionArgs(BaseModelArgs):
     in_channels: int = 3
 
 
-def _rotate(x, angles):
+def _apply_rope(x: mx.array, angles: mx.array) -> mx.array:
     dtype = x.dtype
     half = angles.shape[-1]
     a, b = x[..., :half].astype(mx.float32), x[..., half : 2 * half].astype(mx.float32)
@@ -116,7 +116,7 @@ def _rotate(x, angles):
 
 
 class VisionAttention(nn.Module):
-    def __init__(self, args):
+    def __init__(self, args: VisionArgs):
         super().__init__()
         self.num_heads = args.num_heads
         self.qkv = nn.Linear(args.hidden_size, 3 * args.hidden_size)
@@ -125,7 +125,7 @@ class VisionAttention(nn.Module):
     def __call__(self, x, angles):
         n = x.shape[0]
         q, k, v = self.qkv(x).reshape(n, 3, self.num_heads, -1).transpose(1, 2, 0, 3)
-        q, k = _rotate(q, angles), _rotate(k, angles)
+        q, k = _apply_rope(q, angles), _apply_rope(k, angles)
         y = mx.fast.scaled_dot_product_attention(
             q[None], k[None], v[None], scale=q.shape[-1] ** -0.5
         )
@@ -144,7 +144,7 @@ class VisionMLP(nn.Module):
 
 
 class VisionBlock(nn.Module):
-    def __init__(self, args):
+    def __init__(self, args: VisionArgs):
         super().__init__()
         self.norm1 = nn.LayerNorm(args.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(args.hidden_size, eps=1e-6)
@@ -157,7 +157,7 @@ class VisionBlock(nn.Module):
 
 
 class VisionMerger(VisionMLP):
-    def __init__(self, args):
+    def __init__(self, args: VisionArgs):
         self.dims = args.hidden_size * args.spatial_merge_size**2
         super().__init__(self.dims, self.dims, args.out_hidden_size, approximate=False)
         self.norm = nn.LayerNorm(args.hidden_size, eps=1e-6)
@@ -167,7 +167,7 @@ class VisionMerger(VisionMLP):
 
 
 class VisionPatchEmbed(nn.Module):
-    def __init__(self, args):
+    def __init__(self, args: VisionArgs):
         super().__init__()
         self.proj = nn.Linear(
             args.in_channels * args.temporal_patch_size * args.patch_size**2,
@@ -179,7 +179,7 @@ class VisionPatchEmbed(nn.Module):
 
 
 class VisionModel(nn.Module):
-    def __init__(self, args):
+    def __init__(self, args: VisionArgs):
         super().__init__()
         self.args = args
         self.patch_embed = VisionPatchEmbed(args)
@@ -267,7 +267,9 @@ class Attention(TextAttention):
             frequencies[..., axis : self.sections[axis] * 3 : 3] = angles[
                 axis, ..., axis : self.sections[axis] * 3 : 3
             ]
-        q, k = _rotate(q, frequencies[:, None]), _rotate(k, frequencies[:, None])
+        q, k = _apply_rope(q, frequencies[:, None]), _apply_rope(
+            k, frequencies[:, None]
+        )
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
         out = scaled_dot_product_attention(
@@ -621,10 +623,12 @@ class Model(nn.Module):
         if args.vision_config:
             self.vision_tower = VisionModel(VisionArgs.from_dict(args.vision_config))
 
-    def encode_image(self, pixel_values):
+    def encode_image(self, pixel_values: list[mx.array]) -> mx.array:
         return mx.concatenate([self.vision_tower(p) for p in pixel_values])
 
-    def embed_inputs(self, inputs, *, pixel_values=None):
+    def embed_inputs(
+        self, inputs: mx.array, *, pixel_values: list[mx.array] | None = None
+    ) -> mx.array:
         embeddings = self.model.embed_tokens(inputs)
         if pixel_values is None:
             return embeddings
@@ -642,7 +646,9 @@ class Model(nn.Module):
             mask[:, None], features[index].astype(embeddings.dtype), embeddings
         )
 
-    def _multimodal_positions(self, inputs, grids):
+    def _multimodal_positions(
+        self, inputs: mx.array, grids: list[tuple[int, int]]
+    ) -> mx.array:
         if inputs.ndim != 1:
             raise ValueError("Prepare one multimodal prompt at a time.")
         ids = inputs.tolist()
@@ -672,7 +678,9 @@ class Model(nn.Module):
         position_ids = mx.concatenate(positions, axis=-1)[:, None, :]
         return position_ids
 
-    def get_position_ids(self, inputs, *, pixel_values, cache=None):
+    def get_position_ids(
+        self, inputs: mx.array, *, pixel_values: list[mx.array], cache=None
+    ) -> mx.array:
         merge = self.vision_tower.args.spatial_merge_size
         grids = [(p.shape[0] // merge, p.shape[1] // merge) for p in pixel_values]
         position_ids = self._multimodal_positions(inputs, grids)
@@ -692,10 +700,8 @@ class Model(nn.Module):
         pixel_values=None,
     ):
         if pixel_values is not None:
-            if input_embeddings is not None or inputs.shape[0] != 1:
-                raise ValueError(
-                    "Raw images require one prompt and no input embeddings."
-                )
+            assert input_embeddings is None, "Pass pixel_values or input_embeddings."
+            assert inputs.shape[0] == 1, "Prepare one multimodal prompt at a time."
             input_embeddings = self.embed_inputs(inputs[0], pixel_values=pixel_values)[
                 None
             ]
