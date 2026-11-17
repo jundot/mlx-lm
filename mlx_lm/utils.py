@@ -1201,7 +1201,9 @@ def save(
 
     dst_path = Path(dst_path)
     # Models with a vision tower need vision_config to load it again.
-    keep_vision_config = "vision_tower" in getattr(model, "model", {})
+    keep_vision_config = "vision_tower" in getattr(model, "model", {}) or hasattr(
+        model, "visual"
+    )
     save_model(dst_path, model, donate_model=donate_model)
     save_config(
         config,
@@ -1210,7 +1212,12 @@ def save(
     )
     tokenizer.save_pretrained(dst_path)
 
-    for p in ["*.py", "generation_config.json"]:
+    for p in [
+        "*.py",
+        "generation_config.json",
+        "preprocessor_config.json",
+        "processor_config.json",
+    ]:
         for file in glob.glob(str(src_path / p)):
             shutil.copy(file, dst_path)
 

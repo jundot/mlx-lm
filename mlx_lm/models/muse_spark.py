@@ -874,6 +874,7 @@ class Model(nn.Module):
         inputs: mx.array,
         *,
         pixel_values: mx.array | list[mx.array] | None = None,
+        cache=None,
     ) -> mx.array:
         """The normalized input embeddings, with the vision rows at the patch tokens."""
         h = self.model.language_model.embed(inputs)
