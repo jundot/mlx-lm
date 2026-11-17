@@ -619,10 +619,10 @@ class Model(nn.Module):
         self.model_type = args.model_type
         self.language_model = TextModel(TextModelArgs.from_dict(args.text_config))
         if args.vision_config:
-            self.visual = VisionModel(VisionArgs.from_dict(args.vision_config))
+            self.vision_tower = VisionModel(VisionArgs.from_dict(args.vision_config))
 
     def encode_image(self, pixel_values):
-        return mx.concatenate([self.visual(p) for p in pixel_values])
+        return mx.concatenate([self.vision_tower(p) for p in pixel_values])
 
     def embed_inputs(self, inputs, *, pixel_values=None, cache=None):
         embeddings = self.model.embed_tokens(inputs)
@@ -631,7 +631,7 @@ class Model(nn.Module):
         if inputs.ndim != 1:
             raise ValueError("Prepare one multimodal prompt at a time.")
         ids = inputs.tolist()
-        merge = self.visual.args.spatial_merge_size
+        merge = self.vision_tower.args.spatial_merge_size
         positions, cursor, next_position = [], 0, 0
         for pixels in pixel_values:
             h, w = pixels.shape[:2]
@@ -709,11 +709,11 @@ class Model(nn.Module):
                 if not self.args.vision_config:
                     continue
                 key = (
-                    "visual." + key.split("visual.", 1)[-1]
-                    if "visual." in key
-                    else key.replace("vision_tower.", "visual.", 1)
+                    key.replace("model.visual.", "vision_tower.", 1)
+                    if key.startswith("model.visual.")
+                    else key.replace("visual.", "vision_tower.", 1)
                 )
-                if key == "visual.patch_embed.proj.weight" and value.ndim == 5:
+                if key == "vision_tower.patch_embed.proj.weight" and value.ndim == 5:
                     value = value.reshape(value.shape[0], -1)
             elif key.startswith("model.language_model"):
                 key = key.replace("model.language_model", "language_model.model", 1)
@@ -871,7 +871,7 @@ class Model(nn.Module):
         predicate = self.language_model.quant_predicate
         return lambda path, module: (
             False
-            if path.startswith("visual.")
+            if path.startswith("vision_tower.")
             else (predicate(path, module) if predicate else True)
         )
 

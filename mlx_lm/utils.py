@@ -1202,7 +1202,7 @@ def save(
     dst_path = Path(dst_path)
     # Models with a vision tower need vision_config to load it again.
     keep_vision_config = "vision_tower" in getattr(model, "model", {}) or hasattr(
-        model, "visual"
+        model, "vision_tower"
     )
     save_model(dst_path, model, donate_model=donate_model)
     save_config(
