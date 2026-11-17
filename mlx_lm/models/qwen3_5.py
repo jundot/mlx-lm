@@ -624,18 +624,30 @@ class Model(nn.Module):
     def encode_image(self, pixel_values):
         return mx.concatenate([self.vision_tower(p) for p in pixel_values])
 
-    def embed_inputs(self, inputs, *, pixel_values=None, cache=None):
+    def embed_inputs(self, inputs, *, pixel_values=None):
         embeddings = self.model.embed_tokens(inputs)
         if pixel_values is None:
             return embeddings
         if inputs.ndim != 1:
             raise ValueError("Prepare one multimodal prompt at a time.")
+        features = self.encode_image(pixel_values)
+        mask = inputs == self.args.image_token_id
+        if (
+            sum(t == self.args.image_token_id for t in inputs.tolist())
+            != features.shape[0]
+        ):
+            raise ValueError("Image features and placeholder tokens do not match.")
+        index = mx.clip(mx.cumsum(mask) - 1, 0, features.shape[0] - 1)
+        return mx.where(
+            mask[:, None], features[index].astype(embeddings.dtype), embeddings
+        )
+
+    def _multimodal_positions(self, inputs, grids):
+        if inputs.ndim != 1:
+            raise ValueError("Prepare one multimodal prompt at a time.")
         ids = inputs.tolist()
-        merge = self.vision_tower.args.spatial_merge_size
         positions, cursor, next_position = [], 0, 0
-        for pixels in pixel_values:
-            h, w = pixels.shape[:2]
-            h, w = h // merge, w // merge
+        for h, w in grids:
             start = ids.index(self.args.image_token_id, cursor)
             n = h * w
             if ids[start : start + n] != [self.args.image_token_id] * n:
@@ -658,20 +670,18 @@ class Model(nn.Module):
         tail = mx.arange(next_position, next_position + len(ids) - cursor)
         positions.append(mx.broadcast_to(tail, (3, len(ids) - cursor)))
         position_ids = mx.concatenate(positions, axis=-1)[:, None, :]
+        return position_ids
+
+    def get_position_ids(self, inputs, *, pixel_values, cache=None):
+        merge = self.vision_tower.args.spatial_merge_size
+        grids = [(p.shape[0] // merge, p.shape[1] // merge) for p in pixel_values]
+        position_ids = self._multimodal_positions(inputs, grids)
         if cache is not None:
             c = cache[self.model.fa_idx]
             delta = c[1][0] if isinstance(c, CacheList) else None
             kv = c[0] if isinstance(c, CacheList) else c
             position_ids = position_ids + kv.offset + (0 if delta is None else delta)
-        features = self.encode_image(pixel_values)
-        mask = inputs == self.args.image_token_id
-        if sum(t == self.args.image_token_id for t in ids) != features.shape[0]:
-            raise ValueError("Image features and placeholder tokens do not match.")
-        index = mx.clip(mx.cumsum(mask) - 1, 0, features.shape[0] - 1)
-        embeddings = mx.where(
-            mask[:, None], features[index].astype(embeddings.dtype), embeddings
-        )
-        return {"input_embeddings": embeddings, "position_ids": position_ids}
+        return position_ids
 
     def __call__(
         self,
@@ -686,11 +696,12 @@ class Model(nn.Module):
                 raise ValueError(
                     "Raw images require one prompt and no input embeddings."
                 )
-            prepared = self.embed_inputs(
+            input_embeddings = self.embed_inputs(inputs[0], pixel_values=pixel_values)[
+                None
+            ]
+            position_ids = self.get_position_ids(
                 inputs[0], pixel_values=pixel_values, cache=cache
             )
-            input_embeddings = prepared["input_embeddings"][None]
-            position_ids = prepared["position_ids"]
         return self.language_model(
             inputs,
             cache=cache,

@@ -1102,7 +1102,6 @@ class Model(nn.Module):
         inputs: mx.array,
         *,
         pixel_values: mx.array | list[mx.array] | None = None,
-        cache=None,
     ) -> mx.array:
         inputs_embeds = self.model.language_model.embed(inputs)
         if pixel_values is not None:

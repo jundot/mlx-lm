@@ -28,5 +28,13 @@ def load_processor(
 
 
 def prepare_inputs(model, inputs, *, pixel_values, cache=None):
-    prepared = model.embed_inputs(inputs, pixel_values=pixel_values, cache=cache)
-    return prepared if isinstance(prepared, dict) else {"input_embeddings": prepared}
+    prepared = {
+        "input_embeddings": model.embed_inputs(inputs, pixel_values=pixel_values)
+    }
+    if pixel_values is not None and (
+        get_positions := getattr(model, "get_position_ids", None)
+    ):
+        prepared["position_ids"] = get_positions(
+            inputs, pixel_values=pixel_values, cache=cache
+        )
+    return prepared
