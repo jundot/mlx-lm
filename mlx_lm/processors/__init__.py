@@ -4,10 +4,12 @@
 
 from mlx import nn
 
-from . import inkling2, muse_spark
+from . import inkling2, muse_spark, qwen3_5
 
 # The processor of each model module.
 PROCESSORS = {
+    "qwen3_5": qwen3_5.Processor,
+    "qwen3_5_moe": qwen3_5.Processor,
     "inkling2": inkling2.Processor,
     "muse_spark": muse_spark.Processor,
 }
@@ -15,7 +17,7 @@ PROCESSORS = {
 
 def load_processor(
     model: nn.Module, config: dict
-) -> inkling2.Processor | muse_spark.Processor | None:
+) -> inkling2.Processor | muse_spark.Processor | qwen3_5.Processor | None:
     """The processor of a model, or None."""
     if not config.get("vision_config"):
         return None
@@ -23,3 +25,16 @@ def load_processor(
     name = config.get("processor_type", model_module)
     processor = PROCESSORS.get(name)
     return processor.from_config(config) if processor else None
+
+
+def prepare_inputs(model, inputs, *, pixel_values, cache=None):
+    prepared = {
+        "input_embeddings": model.embed_inputs(inputs, pixel_values=pixel_values)
+    }
+    if pixel_values is not None and (
+        get_positions := getattr(model, "get_position_ids", None)
+    ):
+        prepared["position_ids"] = get_positions(
+            inputs, pixel_values=pixel_values, cache=cache
+        )
+    return prepared

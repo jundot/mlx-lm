@@ -37,7 +37,7 @@ from .models.cache import (
     make_prompt_cache,
     trim_prompt_cache,
 )
-from .processors import load_processor
+from .processors import load_processor, prepare_inputs
 from .sample_utils import LogitsProcessor, Sampler, greedy_sampler, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import (
@@ -337,6 +337,7 @@ def generate_step(
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
+    position_ids: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -365,6 +366,8 @@ def generate_step(
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
+        position_ids (mx.array, optional): Prefill positions, with sequence length
+          on the last axis. Continuation positions are managed by the model cache.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -382,6 +385,11 @@ def generate_step(
         raise ValueError(
             "Either input_embeddings or prompt (or both) must be provided."
         )
+
+    if position_ids is not None:
+        length = len(input_embeddings) if input_embeddings is not None else len(prompt)
+        if position_ids.shape[-1] != length:
+            raise ValueError("Position IDs must match the prompt length.")
 
     tokens = None
 
@@ -403,13 +411,24 @@ def generate_step(
 
     sampler = sampler or greedy_sampler
 
+    position_offset = 0
+
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
+        nonlocal position_offset
+        kwargs = {}
         if input_embeddings is not None:
-            return model(
-                input_tokens, cache=prompt_cache, input_embeddings=input_embeddings
+            kwargs["input_embeddings"] = input_embeddings
+        if position_ids is not None and position_offset < position_ids.shape[-1]:
+            length = (
+                input_embeddings.shape[1]
+                if input_embeddings is not None
+                else input_tokens.shape[-1]
             )
-        else:
-            return model(input_tokens, cache=prompt_cache)
+            kwargs["position_ids"] = position_ids[
+                ..., position_offset : position_offset + length
+            ]
+            position_offset += length
+        return model(input_tokens, cache=prompt_cache, **kwargs)
 
     def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
         nonlocal tokens
@@ -2185,13 +2204,16 @@ def main():
     prompt = tokenizer.encode(prompt, add_special_tokens=not use_chat_template)
 
     if pixel_values is not None:
-        input_embeddings = model.embed_inputs(
-            mx.array(prompt), pixel_values=pixel_values
+        prepared_inputs = prepare_inputs(
+            model,
+            mx.array(prompt),
+            pixel_values=pixel_values,
+            cache=prompt_cache if using_cache else None,
         )
         # The prefill runs on another stream: compute the vision rows first.
-        mx.eval(input_embeddings)
+        mx.eval(prepared_inputs)
     else:
-        input_embeddings = None
+        prepared_inputs = {}
 
     if args.draft_model is not None:
         draft_model, draft_tokenizer = load(args.draft_model)
@@ -2224,7 +2246,7 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
-        input_embeddings=input_embeddings,
+        **prepared_inputs,
     )
     if not args.verbose:
         print(response)

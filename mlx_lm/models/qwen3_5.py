@@ -13,11 +13,12 @@ from .base import (
     create_attention_mask,
     create_ssm_mask,
     gather_last_axis,
+    scaled_dot_product_attention,
 )
-from .cache import ArraysCache, KVCache
+from .cache import ArraysCache, CacheList, KVCache
 from .gated_delta import gated_delta_update, normalize_qk
 from .pipeline import PipelineMixin
-from .qwen3_next import Qwen3NextAttention as Attention
+from .qwen3_next import Qwen3NextAttention as TextAttention
 from .qwen3_next import Qwen3NextMLP as MLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
@@ -83,6 +84,199 @@ class TextModelArgs(BaseModelArgs):
             )
             self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
             self.rope_scaling = self.rope_parameters
+
+
+@dataclass
+class VisionArgs(BaseModelArgs):
+    depth: int
+    hidden_size: int
+    intermediate_size: int
+    num_heads: int
+    out_hidden_size: int
+    num_position_embeddings: int
+    patch_size: int = 16
+    temporal_patch_size: int = 2
+    spatial_merge_size: int = 2
+    in_channels: int = 3
+
+
+def _apply_rope(x: mx.array, angles: mx.array) -> mx.array:
+    dtype = x.dtype
+    half = angles.shape[-1]
+    a, b = x[..., :half].astype(mx.float32), x[..., half : 2 * half].astype(mx.float32)
+    c, s = mx.cos(angles), mx.sin(angles)
+    return mx.concatenate(
+        [
+            (a * c - b * s).astype(dtype),
+            (b * c + a * s).astype(dtype),
+            x[..., 2 * half :],
+        ],
+        axis=-1,
+    )
+
+
+class VisionAttention(nn.Module):
+    def __init__(self, args: VisionArgs):
+        super().__init__()
+        self.num_heads = args.num_heads
+        self.qkv = nn.Linear(args.hidden_size, 3 * args.hidden_size)
+        self.proj = nn.Linear(args.hidden_size, args.hidden_size)
+
+    def __call__(self, x, angles):
+        n = x.shape[0]
+        q, k, v = self.qkv(x).reshape(n, 3, self.num_heads, -1).transpose(1, 2, 0, 3)
+        q, k = _apply_rope(q, angles), _apply_rope(k, angles)
+        y = mx.fast.scaled_dot_product_attention(
+            q[None], k[None], v[None], scale=q.shape[-1] ** -0.5
+        )
+        return self.proj(y[0].transpose(1, 0, 2).reshape(n, -1))
+
+
+class VisionMLP(nn.Module):
+    def __init__(self, dims, hidden_dims, out_dims, approximate=True):
+        super().__init__()
+        self.linear_fc1 = nn.Linear(dims, hidden_dims)
+        self.linear_fc2 = nn.Linear(hidden_dims, out_dims)
+        self.act = nn.GELU(approx="tanh" if approximate else "none")
+
+    def __call__(self, x):
+        return self.linear_fc2(self.act(self.linear_fc1(x)))
+
+
+class VisionBlock(nn.Module):
+    def __init__(self, args: VisionArgs):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(args.hidden_size, eps=1e-6)
+        self.norm2 = nn.LayerNorm(args.hidden_size, eps=1e-6)
+        self.attn = VisionAttention(args)
+        self.mlp = VisionMLP(args.hidden_size, args.intermediate_size, args.hidden_size)
+
+    def __call__(self, x, angles):
+        x = x + self.attn(self.norm1(x), angles)
+        return x + self.mlp(self.norm2(x))
+
+
+class VisionMerger(VisionMLP):
+    def __init__(self, args: VisionArgs):
+        self.dims = args.hidden_size * args.spatial_merge_size**2
+        super().__init__(self.dims, self.dims, args.out_hidden_size, approximate=False)
+        self.norm = nn.LayerNorm(args.hidden_size, eps=1e-6)
+
+    def __call__(self, x):
+        return super().__call__(self.norm(x).reshape(-1, self.dims))
+
+
+class VisionPatchEmbed(nn.Module):
+    def __init__(self, args: VisionArgs):
+        super().__init__()
+        self.proj = nn.Linear(
+            args.in_channels * args.temporal_patch_size * args.patch_size**2,
+            args.hidden_size,
+        )
+
+    def __call__(self, x):
+        return self.proj(x.astype(self.proj.weight.dtype))
+
+
+class VisionModel(nn.Module):
+    def __init__(self, args: VisionArgs):
+        super().__init__()
+        self.args = args
+        self.patch_embed = VisionPatchEmbed(args)
+        self.pos_embed = nn.Embedding(args.num_position_embeddings, args.hidden_size)
+        self.blocks = [VisionBlock(args) for _ in range(args.depth)]
+        self.merger = VisionMerger(args)
+
+    def __call__(self, pixels):
+        h, w, _ = pixels.shape
+        m = self.args.spatial_merge_size
+        rows = mx.broadcast_to(mx.arange(h)[:, None], (h, w))
+        cols = mx.broadcast_to(mx.arange(w)[None, :], (h, w))
+
+        def reorder(x):
+            return x.reshape(h // m, m, w // m, m).transpose(0, 2, 1, 3).reshape(-1)
+
+        rows, cols = reorder(rows), reorder(cols)
+        side = int(self.args.num_position_embeddings**0.5)
+        rh = rows.astype(mx.float32) * ((side - 1) / max(h - 1, 1))
+        rw = cols.astype(mx.float32) * ((side - 1) / max(w - 1, 1))
+        lo_h, lo_w = rh.astype(mx.int32), rw.astype(mx.int32)
+        hi_h, hi_w = mx.minimum(lo_h + 1, side - 1), mx.minimum(lo_w + 1, side - 1)
+        dh, dw = rh - lo_h, rw - lo_w
+        x = self.patch_embed(pixels.reshape(h * w, -1))
+        pos = 0
+        for ih, iw, weight in [
+            (lo_h, lo_w, (1 - dh) * (1 - dw)),
+            (lo_h, hi_w, (1 - dh) * dw),
+            (hi_h, lo_w, dh * (1 - dw)),
+            (hi_h, hi_w, dh * dw),
+        ]:
+            pos = (
+                pos
+                + self.pos_embed(ih * side + iw).astype(mx.float32) * weight[:, None]
+            )
+        x = x + pos.astype(x.dtype)
+        dim = self.args.hidden_size // self.args.num_heads // 2
+        inv = 10000.0 ** (-mx.arange(0, dim, 2, dtype=mx.float32) / dim)
+        angles = mx.concatenate([rows[:, None] * inv, cols[:, None] * inv], axis=-1)
+        for block in self.blocks:
+            x = block(x, angles)
+        return self.merger(x)
+
+
+class Attention(TextAttention):
+    def __init__(self, args):
+        super().__init__(args)
+        self.rotary_dims = int(args.head_dim * args.partial_rotary_factor)
+        self.theta = args.rope_theta
+        self.sections = (args.rope_parameters or {}).get("mrope_section", [11, 11, 10])
+
+    def __call__(self, x, mask=None, cache=None, position_ids=None):
+        state = None
+        if isinstance(cache, CacheList):
+            cache, state = cache[0], cache[1]
+        if position_ids is None and (state is None or state[0] is None):
+            return super().__call__(x, mask, cache)
+        b, length, _ = x.shape
+        offset = cache.offset if cache is not None else 0
+        if position_ids is None:
+            positions = mx.arange(length)[None, :] + offset + state[0]
+            position_ids = mx.broadcast_to(positions[None], (3, b, length))
+        if state is not None:
+            state[0] = (
+                mx.max(position_ids, axis=(0, 2))[:, None] + 1 - (offset + length)
+            )
+        q, gate = mx.split(
+            self.q_proj(x).reshape(b, length, self.num_attention_heads, -1), 2, axis=-1
+        )
+        q = self.q_norm(q).transpose(0, 2, 1, 3)
+        k = self.k_norm(
+            self.k_proj(x).reshape(b, length, self.num_key_value_heads, -1)
+        ).transpose(0, 2, 1, 3)
+        v = (
+            self.v_proj(x)
+            .reshape(b, length, self.num_key_value_heads, -1)
+            .transpose(0, 2, 1, 3)
+        )
+        inv = self.theta ** (
+            -mx.arange(0, self.rotary_dims, 2, dtype=mx.float32) / self.rotary_dims
+        )
+        angles = position_ids[..., None].astype(mx.float32) * inv
+        frequencies = angles[0]
+        for axis in (1, 2):
+            frequencies[..., axis : self.sections[axis] * 3 : 3] = angles[
+                axis, ..., axis : self.sections[axis] * 3 : 3
+            ]
+        q, k = _apply_rope(q, frequencies[:, None]), _apply_rope(
+            k, frequencies[:, None]
+        )
+        if cache is not None:
+            k, v = cache.update_and_fetch(k, v)
+        out = scaled_dot_product_attention(
+            q, k, v, cache=cache, scale=self.scale, mask=mask
+        )
+        out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
+        return self.o_proj(out * mx.sigmoid(gate.reshape(b, length, -1)))
 
 
 class GatedDeltaNet(nn.Module):
@@ -230,11 +424,12 @@ class DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_ids=None,
     ) -> mx.array:
         if self.is_linear:
             r = self.linear_attn(self.input_layernorm(x), mask, cache)
         else:
-            r = self.self_attn(self.input_layernorm(x), mask, cache)
+            r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
         h = x + r
         out = h + self.mlp(self.post_attention_layernorm(h))
         return out
@@ -268,6 +463,7 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        position_ids=None,
     ) -> mx.array:
         if input_embeddings is not None:
             hidden_states = input_embeddings
@@ -283,7 +479,10 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         fa_mask = None
         ssm_mask = None
         if self.fa_idx is not None:
-            fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+            fa_cache = cache[self.fa_idx]
+            if isinstance(fa_cache, CacheList):
+                fa_cache = fa_cache[0]
+            fa_mask = create_attention_mask(hidden_states, fa_cache)
         if self.ssm_idx is not None:
             ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
@@ -293,7 +492,9 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
 
         for layer, c in zip(self.pipeline_layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
-            hidden_states = layer(hidden_states, mask=mask, cache=c)
+            hidden_states = layer(
+                hidden_states, mask=mask, cache=c, position_ids=position_ids
+            )
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -301,10 +502,13 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
                 hidden_states, (pipeline_rank - 1) % pipeline_size
             )
             if cache[-1] is not None:
-                if hasattr(cache[-1], "keys"):
-                    cache[-1].keys = mx.depends(cache[-1].keys, hidden_states)
+                last_cache = cache[-1]
+                if isinstance(last_cache, CacheList):
+                    last_cache = last_cache[0]
+                if hasattr(last_cache, "keys"):
+                    last_cache.keys = mx.depends(last_cache.keys, hidden_states)
                 else:
-                    cache[-1][0] = mx.depends(cache[-1][0], hidden_states)
+                    last_cache[0] = mx.depends(last_cache[0], hidden_states)
 
         # Broadcast h while keeping it in the graph
         if pipeline_size > 1:
@@ -330,8 +534,11 @@ class TextModel(nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        position_ids=None,
     ) -> mx.array:
-        out = self.model(inputs, cache, input_embeddings=input_embeddings)
+        out = self.model(
+            inputs, cache, input_embeddings=input_embeddings, position_ids=position_ids
+        )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
@@ -397,6 +604,8 @@ class TextModel(nn.Module):
 class ModelArgs(BaseModelArgs):
     model_type: str
     text_config: dict
+    vision_config: Optional[dict] = None
+    image_token_id: int = 248056
 
     @classmethod
     def from_dict(cls, params):
@@ -411,15 +620,99 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self.language_model = TextModel(TextModelArgs.from_dict(args.text_config))
+        if args.vision_config:
+            self.vision_tower = VisionModel(VisionArgs.from_dict(args.vision_config))
+
+    def encode_image(self, pixel_values: list[mx.array]) -> mx.array:
+        return mx.concatenate([self.vision_tower(p) for p in pixel_values])
+
+    def embed_inputs(
+        self, inputs: mx.array, *, pixel_values: list[mx.array] | None = None
+    ) -> mx.array:
+        embeddings = self.model.embed_tokens(inputs)
+        if pixel_values is None:
+            return embeddings
+        if inputs.ndim != 1:
+            raise ValueError("Prepare one multimodal prompt at a time.")
+        features = self.encode_image(pixel_values)
+        mask = inputs == self.args.image_token_id
+        if (
+            sum(t == self.args.image_token_id for t in inputs.tolist())
+            != features.shape[0]
+        ):
+            raise ValueError("Image features and placeholder tokens do not match.")
+        index = mx.clip(mx.cumsum(mask) - 1, 0, features.shape[0] - 1)
+        return mx.where(
+            mask[:, None], features[index].astype(embeddings.dtype), embeddings
+        )
+
+    def _multimodal_positions(
+        self, inputs: mx.array, grids: list[tuple[int, int]]
+    ) -> mx.array:
+        if inputs.ndim != 1:
+            raise ValueError("Prepare one multimodal prompt at a time.")
+        ids = inputs.tolist()
+        positions, cursor, next_position = [], 0, 0
+        for h, w in grids:
+            start = ids.index(self.args.image_token_id, cursor)
+            n = h * w
+            if ids[start : start + n] != [self.args.image_token_id] * n:
+                raise ValueError("Image features and placeholder tokens do not match.")
+            text_positions = mx.arange(next_position, next_position + start - cursor)
+            positions.append(mx.broadcast_to(text_positions, (3, start - cursor)))
+            base = next_position + start - cursor
+            grid = mx.stack(
+                [
+                    mx.zeros(n, mx.int32),
+                    mx.repeat(mx.arange(h), w),
+                    mx.tile(mx.arange(w), h),
+                ]
+            )
+            positions.append(grid + base)
+            next_position = base + max(h, w)
+            cursor = start + n
+        if self.args.image_token_id in ids[cursor:]:
+            raise ValueError("More image placeholders than image features.")
+        tail = mx.arange(next_position, next_position + len(ids) - cursor)
+        positions.append(mx.broadcast_to(tail, (3, len(ids) - cursor)))
+        position_ids = mx.concatenate(positions, axis=-1)[:, None, :]
+        return position_ids
+
+    def get_position_ids(
+        self, inputs: mx.array, *, pixel_values: list[mx.array], cache=None
+    ) -> mx.array:
+        merge = self.vision_tower.args.spatial_merge_size
+        grids = [(p.shape[0] // merge, p.shape[1] // merge) for p in pixel_values]
+        position_ids = self._multimodal_positions(inputs, grids)
+        if cache is not None:
+            c = cache[self.model.fa_idx]
+            delta = c[1][0] if isinstance(c, CacheList) else None
+            kv = c[0] if isinstance(c, CacheList) else c
+            position_ids = position_ids + kv.offset + (0 if delta is None else delta)
+        return position_ids
 
     def __call__(
         self,
-        inputs: mx.array,
+        inputs,
         cache=None,
-        input_embeddings: Optional[mx.array] = None,
+        input_embeddings=None,
+        position_ids=None,
+        pixel_values=None,
     ):
+        if pixel_values is not None:
+            assert input_embeddings is None, "Pass pixel_values or input_embeddings."
+            assert inputs.shape[0] == 1, "Prepare one multimodal prompt at a time."
+            input_embeddings = self.embed_inputs(inputs[0], pixel_values=pixel_values)[
+                None
+            ]
+            position_ids = self.get_position_ids(
+                inputs[0], pixel_values=pixel_values, cache=cache
+            )
         return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
+            inputs,
+            cache=cache,
+            input_embeddings=input_embeddings,
+            position_ids=position_ids,
         )
 
     @property
@@ -429,15 +722,22 @@ class Model(nn.Module):
     def sanitize(self, weights):
         sanitized = {}
         for key, value in weights.items():
-            if key.startswith("vision_tower") or key.startswith("model.visual"):
-                continue
-            if key.startswith("model.visual"):
-                continue
-            if key.startswith("model.language_model"):
-                key = key.replace("model.language_model", "language_model.model")
-            elif key.startswith("language_model."):
-                pass
-            else:
+            if key.startswith(("model.visual.", "vision_tower.", "visual.")):
+                if not self.args.vision_config:
+                    continue
+                key = (
+                    key.replace("model.visual.", "vision_tower.", 1)
+                    if key.startswith("model.visual.")
+                    else key.replace("visual.", "vision_tower.", 1)
+                )
+                if key == "vision_tower.patch_embed.proj.weight" and value.ndim == 5:
+                    if value.shape[-1] == self.vision_tower.args.in_channels:
+                        # mlx-vlm stores Conv3d weights with channels last.
+                        value = value.transpose(0, 4, 1, 2, 3)
+                    value = value.reshape(value.shape[0], -1)
+            elif key.startswith("model.language_model"):
+                key = key.replace("model.language_model", "language_model.model", 1)
+            elif not key.startswith("language_model."):
                 key = "language_model." + key
             sanitized[key] = value
         return self.language_model.sanitize(sanitized)
@@ -573,11 +873,27 @@ class Model(nn.Module):
         return self.language_model.model.pipeline_layers
 
     def make_cache(self):
-        return self.language_model.make_cache()
+        return [
+            (
+                ArraysCache(size=2)
+                if layer.is_linear
+                else (
+                    CacheList(KVCache(), ArraysCache(1))
+                    if self.args.vision_config
+                    else KVCache()
+                )
+            )
+            for layer in self.layers
+        ]
 
     @property
     def quant_predicate(self):
-        return self.language_model.quant_predicate
+        predicate = self.language_model.quant_predicate
+        return lambda path, module: (
+            False
+            if path.startswith("vision_tower.")
+            else (predicate(path, module) if predicate else True)
+        )
 
     @property
     def cast_predicate(self):

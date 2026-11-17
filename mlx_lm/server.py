@@ -45,7 +45,7 @@ from .generate import (
     stream_generate,
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
-from .processors import load_processor
+from .processors import load_processor, prepare_inputs
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import (
     _parse_size,
@@ -1094,15 +1094,15 @@ class ResponseGenerator:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # The images after the cached tokens.
-            input_embeddings = None
+            prepared_inputs = {}
             if vision is not None:
                 n = sum(i < ctx.prompt_cache_count for i in vision.starts)
                 if pixel_values := vision.pixel_values[n:]:
-                    input_embeddings = model.embed_inputs(
-                        mx.array(rest), pixel_values=pixel_values
+                    prepared_inputs = prepare_inputs(
+                        model, mx.array(rest), pixel_values=pixel_values, cache=cache
                     )
                     # The prefill runs on another stream: compute the vision rows first.
-                    mx.eval(input_embeddings)
+                    mx.eval(prepared_inputs)
 
             # Process the prompt and generate tokens
             stop_reader = stop_sm.reader()
@@ -1117,7 +1117,7 @@ class ResponseGenerator:
                 prompt_cache=cache,
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
-                input_embeddings=input_embeddings,
+                **prepared_inputs,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
                 kv_bits=self.cli_args.kv_bits,
