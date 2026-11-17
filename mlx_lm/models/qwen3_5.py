@@ -731,6 +731,9 @@ class Model(nn.Module):
                     else key.replace("visual.", "vision_tower.", 1)
                 )
                 if key == "vision_tower.patch_embed.proj.weight" and value.ndim == 5:
+                    if value.shape[-1] == self.vision_tower.args.in_channels:
+                        # mlx-vlm stores Conv3d weights with channels last.
+                        value = value.transpose(0, 4, 1, 2, 3)
                     value = value.reshape(value.shape[0], -1)
             elif key.startswith("model.language_model"):
                 key = key.replace("model.language_model", "language_model.model", 1)
