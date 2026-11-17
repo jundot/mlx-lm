@@ -2192,7 +2192,7 @@ def main():
             prompt = prompt[test_prompt.index("<query>") :]
 
     if args.image:
-        processor = load_processor(model, config, model_path)
+        processor = load_processor(model, config)
         if processor is None:
             raise ValueError(f"The model {model_path} does not take images.")
         from PIL import Image

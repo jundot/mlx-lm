@@ -16,7 +16,7 @@ PROCESSORS = {
 
 
 def load_processor(
-    model: nn.Module, config: dict, model_path=None
+    model: nn.Module, config: dict
 ) -> inkling2.Processor | muse_spark.Processor | qwen3_5.Processor | None:
     """The processor of a model, or None."""
     if not config.get("vision_config"):
@@ -24,8 +24,6 @@ def load_processor(
     model_module = type(model).__module__.rsplit(".", 1)[-1]
     name = config.get("processor_type", model_module)
     processor = PROCESSORS.get(name)
-    if processor is qwen3_5.Processor:
-        return processor.from_pretrained(model_path)
     return processor.from_config(config) if processor else None
 
 

@@ -11,14 +11,20 @@ class Processor:
         self.image_processor = image_processor
 
     @classmethod
-    def from_pretrained(cls, model_path):
-        from transformers import AutoImageProcessor
+    def from_config(cls, config):
+        from transformers import Qwen2VLImageProcessorPil
 
-        if model_path is None:
-            raise ValueError(
-                "Qwen3.5 needs the checkpoint's image processor configuration."
+        vision = config["vision_config"]
+        return cls(
+            Qwen2VLImageProcessorPil(
+                size={"shortest_edge": 65536, "longest_edge": 16777216},
+                patch_size=vision.get("patch_size", 16),
+                temporal_patch_size=vision.get("temporal_patch_size", 2),
+                merge_size=vision.get("spatial_merge_size", 2),
+                image_mean=[0.5, 0.5, 0.5],
+                image_std=[0.5, 0.5, 0.5],
             )
-        return cls(AutoImageProcessor.from_pretrained(model_path, backend="pil"))
+        )
 
     def __call__(self, text, *, images):
         parts = text.split(self.image_token)

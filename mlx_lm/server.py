@@ -481,7 +481,7 @@ class ModelProvider:
         self.model_key = (model_path, adapter_path, draft_model_path)
         self.model = model
         self.tokenizer = tokenizer
-        self.processor = load_processor(model, config, model_path)
+        self.processor = load_processor(model, config)
         self.draft_model = draft_model
         self.is_batchable = is_batchable
 

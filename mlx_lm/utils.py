@@ -1212,12 +1212,7 @@ def save(
     )
     tokenizer.save_pretrained(dst_path)
 
-    for p in [
-        "*.py",
-        "generation_config.json",
-        "preprocessor_config.json",
-        "processor_config.json",
-    ]:
+    for p in ["*.py", "generation_config.json"]:
         for file in glob.glob(str(src_path / p)):
             shutil.copy(file, dst_path)
 
