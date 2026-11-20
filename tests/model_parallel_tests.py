@@ -5,10 +5,10 @@ import unittest
 
 import mlx.core as mx
 
+from mlx_lm.layers.distributed import PipelineMixin
 from mlx_lm.models import muse_spark, qwen2, qwen3_moe, qwen3_next
 from mlx_lm.models.cache import make_prompt_cache
-from mlx_lm.models.pipeline import PipelineMixin
-from mlx_lm.utils import quantize_model
+from mlx_lm.utils import model_package, quantize_model
 
 MUSE_SPARK_OPEN = {
     "model_type": "muse_spark",
@@ -164,7 +164,7 @@ class TestModelParallel(unittest.TestCase):
         for config in test_configs:
             model_type = config["model_type"]
             with self.subTest(f"Testing {model_type}", model_type=model_type):
-                arch = importlib.import_module(f"mlx_lm.models.{model_type}")
+                arch = importlib.import_module(f"mlx_lm.models.{model_package(config)}")
                 args = arch.ModelArgs.from_dict(config)
                 model = arch.Model(args)
                 vocab_size = args.vocab_size
@@ -264,7 +264,7 @@ class TestModelParallel(unittest.TestCase):
         for config in test_configs:
             model_type = config["model_type"]
             with self.subTest(f"Testing {model_type}", model_type=model_type):
-                arch = importlib.import_module(f"mlx_lm.models.{model_type}")
+                arch = importlib.import_module(f"mlx_lm.models.{model_package(config)}")
                 args = arch.ModelArgs.from_dict(config)
                 model = arch.Model(args)
                 vocab_size = args.vocab_size
@@ -297,6 +297,32 @@ class TestModelParallel(unittest.TestCase):
                 model.shard()
                 for e, out in zip(expected, run()):
                     self.assertTrue(mx.allclose(e, out, rtol=1e-3, atol=1e-3))
+
+    def test_inkling2(self):
+        from models.test_inkling2 import UNPADDED_VOCAB, create_model, quantize_experts
+
+        for parallel in ("tensor", "pipeline"):
+            for quantized in (False, True):
+                with self.subTest(parallel=parallel, quantized=quantized):
+                    model = create_model()
+                    if quantized:
+                        quantize_experts(model)
+                    x = mx.random.randint(0, UNPADDED_VOCAB, shape=(2, 13))
+
+                    def run():
+                        cache = model.make_cache()
+                        outputs = [model(x[:, :10], cache=cache)]
+                        for i in range(10, 13):
+                            outputs.append(model(x[:, i : i + 1], cache=cache))
+                        return outputs
+
+                    expected = run()
+                    if parallel == "tensor":
+                        model.shard()
+                    else:
+                        model.model.pipeline(mx.distributed.init())
+                    for e, out in zip(expected, run()):
+                        self.assertTrue(mx.allclose(e, out, rtol=1e-3, atol=1e-3))
 
     def test_pipeline_layer_assignment(self):
         def assignment(num_layers, size, split=None):
