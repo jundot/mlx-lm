@@ -24,7 +24,6 @@ from typing import (
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
@@ -37,7 +36,7 @@ from .models.cache import (
     make_prompt_cache,
     trim_prompt_cache,
 )
-from .processors import load_processor
+from .processors import load_image, load_processor
 from .sample_utils import LogitsProcessor, Sampler, greedy_sampler, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import (
@@ -2173,22 +2172,18 @@ def main():
             prompt = prompt[test_prompt.index("<query>") :]
 
     if args.image:
-        processor = load_processor(model, config)
+        processor = load_processor(config)
         if processor is None:
             raise ValueError(f"The model {model_path} does not take images.")
-        from PIL import Image
-
-        images = [np.asarray(Image.open(f).convert("RGB")) for f in args.image]
-        prompt, pixel_values = processor(prompt, images=images)
+        images = [load_image(processor, f) for f in args.image]
+        prompt, media_inputs = processor(prompt, images=images)
     else:
-        pixel_values = None
+        media_inputs = {}
     prompt = tokenizer.encode(prompt, add_special_tokens=not use_chat_template)
 
-    if pixel_values is not None:
-        input_embeddings = model.embed_inputs(
-            mx.array(prompt), pixel_values=pixel_values
-        )
-        # The prefill runs on another stream: compute the vision rows first.
+    if media_inputs:
+        input_embeddings = model.embed_inputs(mx.array(prompt), **media_inputs)
+        # The prefill runs on another stream: compute the media rows first.
         mx.eval(input_embeddings)
     else:
         input_embeddings = None
